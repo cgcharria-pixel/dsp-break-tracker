@@ -37,26 +37,26 @@ def parse_adp(file) -> pd.DataFrame:
     except Exception as e:
         raise ValueError(f"Cannot read ADP file: {e}")
 
-    # ── find header row ────────────────────────────────────────────
+    # ── find header row ──────────────────────────────────────────────────────
     header_row = None
     for i, row in raw.iterrows():
         vals = [str(v).strip().lower() for v in row if pd.notna(v)]
-        if any("employee" in v for v in vals):
+        if any("employee" in v or "payroll name" in v or v == "payroll name" for v in vals):
             header_row = i
             break
 
     if header_row is None:
-        raise ValueError("Cannot locate header row in ADP file (looking for 'Employee').")
+        raise ValueError("Cannot locate header row in ADP file (looking for 'Employee' or 'Payroll Name').")
 
     df = raw.iloc[header_row + 1:].copy()
     df.columns = [str(c).strip() for c in raw.iloc[header_row]]
     df = df.dropna(how="all").reset_index(drop=True)
 
-    # ── column detection ───────────────────────────────────────────
+    # ── column detection ─────────────────────────────────────────────────────
     col_map = {}
     for col in df.columns:
-        lc = col.lower()
-        if "employee" in lc and "name" in lc:
+        lc = col.lower().strip()
+        if ("employee" in lc and "name" in lc) or lc == "payroll name":
             col_map["employee_name"] = col
         elif "file" in lc and "#" in lc:
             col_map["file_number"] = col
@@ -66,12 +66,14 @@ def parse_adp(file) -> pd.DataFrame:
             col_map["ot_hrs"] = col
         elif "total" in lc and "hr" in lc:
             col_map["total_hrs"] = col
-        elif "punch" in lc and "in" in lc:
+        elif "payroll hours" in lc or ("payroll" in lc and "hour" in lc):
+            col_map["total_hrs"] = col
+        elif ("punch" in lc and "in" in lc) or lc == "time in":
             col_map["punch_in"] = col
-        elif "punch" in lc and "out" in lc:
+        elif ("punch" in lc and "out" in lc) or lc == "time out":
             col_map["punch_out"] = col
 
-    # ── build output ───────────────────────────────────────────
+    # ── build output ─────────────────────────────────────────────────────────
     result = pd.DataFrame()
     result["employee_name"] = (
         df[col_map["employee_name"]].astype(str).str.strip()
@@ -94,7 +96,7 @@ def parse_adp(file) -> pd.DataFrame:
         else:
             result[field] = pd.NaT
 
-    # ── compute ADP shift duration ───────────────────────────────────────
+    # ── compute ADP shift duration ───────────────────────────────────────────
     if result["punch_in"].notna().any() and result["punch_out"].notna().any():
         result["adp_duration_min"] = (
             (result["punch_out"] - result["punch_in"]).dt.total_seconds() / 60
@@ -102,7 +104,7 @@ def parse_adp(file) -> pd.DataFrame:
     else:
         result["adp_duration_min"] = result["total_hrs"] * 60
 
-    # ── clean employee names ──────────────────────────────────────────
+    # ── clean employee names ─────────────────────────────────────────────────
     result = result[result["employee_name"].str.len() > 1].copy()
     result["employee_name"] = result["employee_name"].apply(
         lambda n: _split_camelcase(n) if n == n.title() else n
@@ -131,39 +133,47 @@ def parse_amazon(file) -> pd.DataFrame:
     except Exception as e:
         raise ValueError(f"Cannot read Amazon file: {e}")
 
-    # ── find header row ────────────────────────────────────────────
+    # ── find header row ──────────────────────────────────────────────────────
     header_row = None
     for i, row in raw.iterrows():
         vals = [str(v).strip().lower() for v in row if pd.notna(v)]
-        if any("associate" in v or "employee" in v or "name" in v for v in vals):
+        # Require at least 2 header-like tokens in the same row (avoids note rows)
+        hits = sum(1 for v in vals if any(k in v for k in
+                   ("associate", "da name", "transporter", "break start", "break end",
+                    "duration", "shift start", "shift end", "employee", "badge")))
+        if hits >= 2:
             header_row = i
             break
 
     if header_row is None:
-        raise ValueError("Cannot locate header row in Amazon file (looking for 'Associate' or 'Name').")
+        raise ValueError("Cannot locate header row in Amazon file (looking for 'DA Name' / 'Break Start' etc.).")
 
     df = raw.iloc[header_row + 1:].copy()
     df.columns = [str(c).strip() for c in raw.iloc[header_row]]
     df = df.dropna(how="all").reset_index(drop=True)
 
-    # ── column detection ───────────────────────────────────────────
+    # ── column detection ─────────────────────────────────────────────────────
     col_map = {}
     for col in df.columns:
-        lc = col.lower()
+        lc = col.lower().strip().rstrip(":")
         if ("associate" in lc or "employee" in lc) and "name" in lc:
             col_map["associate_name"] = col
-        elif "name" in lc and "associate" not in col_map:
+        elif "da name" in lc or lc == "name":
             col_map["associate_name"] = col
-        elif "id" in lc or "badge" in lc:
+        elif "name" in lc and "associate_name" not in col_map:
+            col_map["associate_name"] = col
+        elif "transporter" in lc or "badge" in lc or (lc.endswith("id") and "duration" not in lc):
             col_map["associate_id"] = col
-        elif "start" in lc:
+        elif "break start" in lc or lc == "start":
             col_map["shift_start"] = col
-        elif "end" in lc:
+        elif "break end" in lc or lc == "end":
             col_map["shift_end"] = col
+        elif "break duration" in lc or "duration in minutes" in lc:
+            col_map["duration"] = col
         elif "duration" in lc or "hours" in lc:
             col_map["duration"] = col
 
-    # ── build output ───────────────────────────────────────────
+    # ── build output ─────────────────────────────────────────────────────────
     result = pd.DataFrame()
     result["associate_name"] = (
         df[col_map["associate_name"]].astype(str).str.strip()
@@ -180,13 +190,14 @@ def parse_amazon(file) -> pd.DataFrame:
         else:
             result[field] = pd.NaT
 
-    # ── compute Amazon shift duration ───────────────────────────────────────
-    if result["shift_start"].notna().any() and result["shift_end"].notna().any():
+    # ── compute Amazon break duration ─────────────────────────────────────────
+    # Prefer explicit duration column (already in minutes for DA Break reports)
+    if "duration" in col_map:
+        result["amz_duration_min"] = pd.to_numeric(df[col_map["duration"]], errors="coerce").fillna(0.0)
+    elif result["shift_start"].notna().any() and result["shift_end"].notna().any():
         result["amz_duration_min"] = (
             (result["shift_end"] - result["shift_start"]).dt.total_seconds() / 60
         ).round(1)
-    elif "duration" in col_map:
-        result["amz_duration_min"] = pd.to_numeric(df[col_map["duration"]], errors="coerce").fillna(0.0) * 60
     else:
         result["amz_duration_min"] = 0.0
 
@@ -204,44 +215,71 @@ def _normalize_name(name: str) -> str:
     name = str(name).lower().strip()
     name = re.sub(r"[^a-z\s]", "", name)
     name = re.sub(r"\s+", " ", name)
+    return name.strip()
+
+
+def _adp_to_canonical(name: str) -> str:
+    """
+    Convert ADP 'LastName(s), FirstName [Middle]' → 'firstname lastname(s)'.
+    e.g. 'Acosta Arenas, Angie Nathalia' → 'angie acosta arenas'
+    """
+    name = _normalize_name(name)
+    if "," in str(name):
+        # Already normalized so comma is gone — re-work from original
+        pass
     return name
 
 
-def _last_first(name: str) -> str:
-    """Convert 'First Last' → 'last first' for matching."""
-    parts = name.strip().split()
-    if len(parts) >= 2:
-        return f"{parts[-1]} {' '.join(parts[:-1])}"
-    return name
+def _adp_name_canonical(raw_name: str) -> str:
+    """
+    Convert raw ADP 'Last, First [Middle]' to 'first last' canonical form.
+    'Acosta Arenas, Angie Nathalia' → 'angie acosta arenas'
+    'Alvarez, Rainer'               → 'rainer alvarez'
+    """
+    s = str(raw_name).strip()
+    if "," in s:
+        last_part, first_part = s.split(",", 1)
+        last_part = last_part.strip().lower()
+        first_words = first_part.strip().lower().split()
+        first_name = first_words[0] if first_words else ""
+        canonical = re.sub(r"[^a-z\s]", "", f"{first_name} {last_part}")
+        return re.sub(r"\s+", " ", canonical).strip()
+    return _normalize_name(s)
 
 
 def match_employees(adp_df: pd.DataFrame, amazon_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fuzzy-match ADP employees to Amazon associates by name.
+    Match ADP employees to Amazon associates by name.
+    ADP format: 'Last, First [Middle]'  →  canonical: 'first last(s)'
+    Amazon format: 'First Last(s)'      →  canonical: same after normalize
     Returns merged DataFrame with both sets of columns.
     """
     adp = adp_df.copy()
     amz = amazon_df.copy()
 
-    adp["_key"] = adp["employee_name"].apply(_normalize_name)
-    adp["_key_lf"] = adp["_key"].apply(_last_first)
+    # ADP: convert "Last, First" → "first last" canonical key
+    adp["_key"] = adp["employee_name"].apply(_adp_name_canonical)
 
+    # Amazon: normalize "First Last" → "first last"
     amz["_key"] = amz["associate_name"].apply(_normalize_name)
-    amz["_key_lf"] = amz["_key"].apply(_last_first)
 
-    # ── exact match on normalised name ──────────────────────────────────────
-    merged = adp.merge(amz, on="_key", how="outer", suffixes=("_adp", "_amz"))
+    # ── exact match on canonical key ─────────────────────────────────────────
+    merged = adp.merge(amz, on="_key", how="left", suffixes=("_adp", "_amz"))
 
-    # ── second pass: last-first swap for unmatched ───────────────────────────
-    unmatched_adp = merged[merged["associate_name"].isna()]["employee_name"].tolist()
-    unmatched_amz = merged[merged["employee_name"].isna()]["associate_name"].tolist()
-
-    if unmatched_adp and unmatched_amz:
-        adp2 = adp[adp["employee_name"].isin(unmatched_adp)].copy()
-        amz2 = amz[amz["associate_name"].isin(unmatched_amz)].copy()
-        merged2 = adp2.merge(amz2, left_on="_key_lf", right_on="_key", how="inner", suffixes=("_adp", "_amz"))
+    # ── second pass: try matching on last name only for remaining unmatched ──
+    unmatched_mask = merged["associate_name"].isna()
+    if unmatched_mask.any():
+        unmatched_adp = adp[adp["_key"].isin(merged[unmatched_mask]["_key"])].copy()
+        unmatched_adp["_last"] = unmatched_adp["_key"].apply(lambda k: k.split()[-1] if k.split() else k)
+        amz_unmatched = amz[~amz["_key"].isin(merged[~unmatched_mask]["_key"])].copy()
+        amz_unmatched["_last"] = amz_unmatched["_key"].apply(lambda k: k.split()[-1] if k.split() else k)
+        merged2 = unmatched_adp.merge(amz_unmatched, on="_last", how="inner",
+                                       suffixes=("_adp", "_amz"))
         if not merged2.empty:
-            merged = pd.concat([merged[~merged["employee_name"].isin(unmatched_adp)], merged2], ignore_index=True)
+            merged = pd.concat(
+                [merged[~unmatched_mask], merged2],
+                ignore_index=True
+            )
 
     merged.drop(columns=[c for c in merged.columns if c.startswith("_")], inplace=True, errors="ignore")
     return merged.reset_index(drop=True)
@@ -398,7 +436,7 @@ def export_excel(df: pd.DataFrame, report_date: date, station: str) -> bytes:
     """
     output = io.BytesIO()
 
-    # ── select / rename display columns ───────────────────────────────────────
+    # ── select / rename display columns ─────────────────────────────────────
     display_cols = {
         "employee_name":      "Employee Name",
         "file_number":        "File #",
